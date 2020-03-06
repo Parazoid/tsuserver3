@@ -1,23 +1,32 @@
+import asyncio
 import gettext
 import warnings
 import yaml
 from copy import deepcopy
 from types import MethodType
+from typing import Iterable
+from threading import Thread
+
+import jsonpatch
 
 import pygubu
 from pygubu.widgets.editabletreeview import EditableTreeview
 
-import jsonpatch
-
 import tkinter as tk
 import tkinter.ttk as ttk
 import tkinter.messagebox
-import tkinter.simpledialog
 
+from . import edittypes
+from .remoteadmin import RemoteAdmin
 
 t = gettext.translation("tsuserver_config", "translations")
 _ = t.gettext
 
+loop = asyncio.get_event_loop()
+def loop_func():
+    asyncio.set_event_loop(loop)
+    loop.run_forever()
+loop_thread = Thread(target=loop_func, daemon=True)
 
 def hack_etv(etv: EditableTreeview):
     """Hack up Pygubu's half-decent EditableTreeview in various ways:
@@ -30,6 +39,7 @@ def hack_etv(etv: EditableTreeview):
     updateWnds = etv._EditableTreeview__updateWnds
     etv._EditableTreeview__updateWnds = lambda: None
     etv.bind('<Double-Button-1>', updateWnds)
+    etv.bind('<Return>', updateWnds)
     etv.forceUpdateWnds = updateWnds
 
     def inplace_widget(self, col):
@@ -53,27 +63,38 @@ def walk(d: dict, path):
         @value.setter
         def value(self, val):
             elem[path[-1]] = val
+        @value.deleter
+        def value(self):
+            del elem[path[-1]]
 
     return DictValue()
 
 class TsuserverConfig:
     def __init__(self):
+        loop.call_soon_threadsafe(asyncio.ensure_future, self.start_client())
+
         self.builder = builder = pygubu.Builder(_)
         builder.add_from_file("ui/main.ui")
         self.main_window = builder.get_object("tsuserver_config_toplevel")
         self.etv: EditableTreeview = builder.get_object("etv")
         self.btn_apply = builder.get_object('btn_apply')
         self.btn_revert = builder.get_object('btn_revert')
+        self.lbl_server_status: tk.Label = builder.get_object('lbl_server_status')
+        self.lbl_ms_status = builder.get_object('lbl_ms_status')
         hack_etv(self.etv)
         builder.connect_callbacks(self)
 
-        # self.etv.insert('', tk.END, '/', text="Root", values=("root",))
-        # self.etv.insert('/', tk.END, '/hello', text="Hello", values=("hello",))
-        # self.etv.insert('/', tk.END, '/world', text="World", values=("world",))
         self._reload_config()
         self.etv.bind('<<TreeviewInplaceEdit>>', self._on_inplace_edit)
         #self.etv.bind('<Double-Button-1>', self._on_inplace_edit)
         self.etv.bind('<<TreeviewCellEdited>>', self._on_cell_edited)
+
+    async def start_client(self):
+        self.client = RemoteAdmin()
+        try:
+            await self.client.connect('ws://localhost:50003/')
+        except OSError:
+            self.lbl_server_status.config(text='Error connecting. Too bad.')
 
     def run(self):
         self.main_window.mainloop()
@@ -90,13 +111,46 @@ class TsuserverConfig:
         self._delete_inplace_widgets()
 
         self.etv_meta_dict = {}
-        self.options_orig = yaml.safe_load(open('config/config.yaml'))
+        self.options_orig = {
+            '$config': { 'name': 'General' },
+            'config': yaml.safe_load(open('config/config.yaml')),
+            '$music': { 'name': 'Music', 'type': 'music' },
+            'music': yaml.safe_load(open('config/music.yaml')),
+            '$areas': { 'name': 'Rooms', 'type': 'rooms' },
+            'areas': yaml.safe_load(open('config/areas.yaml')),
+            '$backgrounds': { 'name': 'Backgrounds' },
+            'backgrounds': yaml.safe_load(open('config/backgrounds.yaml')),
+            '$characters': { 'name': 'Characters' },
+            'characters': yaml.safe_load(open('config/characters.yaml'))
+        }
         self.options = deepcopy(self.options_orig)
         self.unpack_dict(self.options)
         self._check_config()
 
+    def _make_patch(self):
+        patch = jsonpatch.make_patch(self.options_orig,
+                                     deepcopy(self.options)).patch
+
+        # Ignore all patches involving metadata
+        patch = [p for p in patch if '/$' not in p['path']]
+        def prune_dollars(d: dict):
+            for k, v in list(d.items()):
+                if isinstance(k, str) and k[0] == '$':
+                    del d[k]
+                elif isinstance(v, dict):
+                    prune_dollars(v)
+                elif isinstance(v, list):
+                    prune_dollars(enumerate(v))
+        for p in patch:
+            if 'value' in p:
+                if isinstance(p['value'], dict):
+                    prune_dollars(p['value'])
+                elif isinstance(p['value'], list):
+                    prune_dollars(enumerate(p['value']))
+        return patch
+
     def _apply_changes(self):
-        patch = jsonpatch.make_patch(self.options_orig, self.options).patch
+        patch = self._make_patch()
         changes_str = ''
         msg = _('The following changes will be COMMITTED:\n')
         for entry in patch:
@@ -110,10 +164,20 @@ class TsuserverConfig:
             self.options_orig = deepcopy(self.options)
 
     def _check_config(self):
-        patch = jsonpatch.make_patch(self.options_orig, self.options).patch
+        patch = self._make_patch()
         state = ['!disabled' if len(patch) > 0 else 'disabled']
         self.btn_apply.state(state)
         self.btn_revert.state(state)
+
+    def unpack_items(self, it: Iterable, *args, key_name=None, **kwargs):
+        if key_name is not None:
+            kv = dict(
+                **{str(k): v for k, v in enumerate(it)},
+                **{f'${k}': { 'name': v[key_name] } for k, v in enumerate(it)}
+            )
+        else:
+            kv = {str(k): v for k, v in enumerate(it)}
+        return self.unpack_dict(kv, *args, **kwargs)
 
     def unpack_dict(self, d: dict, parent=''):
         for k, v in d.items():
@@ -123,40 +187,43 @@ class TsuserverConfig:
             id = f'{parent}/{k}'
             name = k
             desc = ''
+            key_name = None
 
-            edit_types = {
-                str: 'string',
-                int: 'number',
-                dict: 'object',
-                bool: 'boolean'
-            }
-            edit_type = edit_types[type(v)]
             try:
                 metadata = d['$' + k]
-                if 'desc' in metadata:
-                    desc = metadata['desc']
-                if 'type' in metadata:
-                    edit_type = metadata['type']
-                if 'name' in metadata:
-                    name = metadata['name']
             except KeyError:
-                pass
+                metadata = {}
+            try:
+                edit_type = metadata['type']
+            except KeyError:
+                edit_type = type(v)
+
+            edit_type = edittypes.get(edit_type)(self.etv, metadata)
+
+            edit_type.preprocess(v)
+
+            if 'desc' in metadata:
+                desc = metadata['desc']
+            if 'name' in metadata:
+                name = metadata['name']
+            if 'key_name' in metadata:
+                key_name = metadata['key_name']
+
 
             self.etv_meta_dict[id] = {
                 'name': name,
                 'desc': desc,
-                'type': edit_type
+                'type': edit_type,
+                'key_name': key_name
             }
 
-            if isinstance(v, dict):
-                values = ('<object>', desc)
-            else:
-                values = (v, desc)
-
-            self.etv.insert(parent, tk.END, id, text=name, values=values)
+            self.etv.insert(parent, tk.END, id, text=name,
+                            values=edit_type.row(v))
 
             if isinstance(v, dict):
                 self.unpack_dict(v, parent=id)
+            elif isinstance(v, list):
+                self.unpack_items(v, key_name=key_name, parent=id)
 
     def _on_inplace_edit(self, _event):
         """Called when an value is activated for editing."""
@@ -168,82 +235,28 @@ class TsuserverConfig:
 
         meta = self.etv_meta_dict[item]
         edit_type = meta['type']
-        if edit_type == 'string':
-            self.etv.inplace_entry(col, item)
-        elif edit_type == 'number':
-            self.etv.inplace_spinbox(col, item, 0, 65536, 1)
-        elif edit_type == 'boolean':
-            self.etv.inplace_checkbutton(col, item)
-        elif edit_type == 'none':
-            pass
-        elif edit_type == 'mod':
-            option = walk(self.options, item)
-            if isinstance(option.value, str):
-                # Old-style modpass. Ask if user wants to convert it to a
-                # new-style pass.
-                msg = _('You have an old-style modpass. Do you wish to convert ' \
-                        'it to a multi-profile modpass?')
-                if 'ignore_prompt' not in meta and \
-                        tk.messagebox.askyesno(message=msg, icon='warning'):
-                    modpass = option.value
-                    option.value = {
-                        'default': {
-                            'password': modpass
-                        }
-                    }
-                    self.unpack_dict(option.value, item)
-                    values = self.etv.item(item, 'values')
-                    values = ('<object>', *values[1:])
-                    self.etv.item(item, values=values)
-                    self._check_config()
-                else:
-                    # Fine. Screw you then.
-                    meta['ignore_prompt'] = True
-                    self.etv.inplace_entry(col, item)
-                    return
 
-            # Show a button.
-            self.etv.inplace_custom(col, item, ttk.Button(self.etv, text='+'))
-            def add_mod_entry(_event):
-                msg = _('Enter the profile name of the mod:')
-                profile = tk.simpledialog.askstring(_('New Mod'), msg)
-                if profile is None:
-                    return
-                profile = profile.strip()
-                if profile == '':
-                    return
+        me = self
+        class Proxy:
+            def unpack_dict(self, d, item):
+                me.unpack_dict(d, item)
+                me._check_config()
 
-                modpass_list = walk(self.options, item).value
-                if profile in modpass_list:
-                    msg = _('That profile already exists.')
-                    tk.messagebox.showerror(_('New Mod'), msg)
+            @property
+            def option(self):
+                return walk(me.options, item).value
 
-                modpass_list[profile] = {
-                    'password': 'modpass'
-                }
-                self.unpack_dict({
-                    profile: modpass_list[profile]
-                }, item)
-                self._check_config()
+            @option.setter
+            def option(self, value):
+                walk(me.options, item).value = value
+                me._check_config()
 
-            self.etv.inplace_widget(col).bind('<Button-1>', add_mod_entry)
-            self.etv.forceUpdateWnds()
-        elif edit_type == 'object':
-            # Special case for mod entries: Add a minus button.
-            up = '/'.join(item.split('/')[:-1])
-            if self.etv_meta_dict[up]['type'] == 'mod':
-                self.etv.inplace_custom(col, item, ttk.Button(self.etv, text='-'))
-                def remove_mod_entry(_event):
-                    profile = item.split('/')[-1]
-                    msg = _(f'Mod profile \'{profile}\' will be deleted.')
-                    if tk.messagebox.askokcancel('Delete Mod', msg):
-                        self.etv.delete(item)
-                    self._check_config()
+            @option.deleter
+            def option(self):
+                del walk(me.options, item).value
+                me._check_config()
 
-                self.etv.inplace_widget(col).bind('<Button-1>', remove_mod_entry)
-                self.etv.forceUpdateWnds()
-        else:
-            warnings.warn(f'options dict has invalid edit type {edit_type}')
+        edit_type.on_edit(col, item, Proxy())
 
         try:
             self.etv.inplace_widget(col).focus_force()
@@ -256,19 +269,11 @@ class TsuserverConfig:
 
         val = self.etv.item(item, 'values')[0]
         edit_type = self.etv_meta_dict[item]['type']
-        if edit_type == 'string':
-            pass
-        elif edit_type == 'number':
-            val = int(val)
-        elif edit_type == 'boolean':
-            val = True if val == 'True' else False
-        elif edit_type == 'mod' and type(val) == str:
-            pass
-        else:
+        real_val = edit_type.value(val)
+        if real_val is None:
             return
 
-        walk(self.options, item).value = val
-
+        walk(self.options, item).value = real_val
         self._check_config()
 
     def _delete_inplace_widgets(self):
@@ -283,5 +288,7 @@ class TsuserverConfig:
             pass
 
 def main():
+    loop_thread.start()
     application = TsuserverConfig()
     application.run()
+    loop.stop()
