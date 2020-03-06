@@ -54,10 +54,17 @@ class AOProtocol(asyncio.Protocol):
 
     def dezalgo(self, input):
         """
-        Turns any string into a de-zalgo'd version, with a tolerance to allow for special language characters.
+        Turns any string into a de-zalgo'd version, with a tolerance to allow for normal diacritic use.
+
+        The following Unicode blocks are scrubbed:
+        U+0300 - U+036F - COMBINING DIACRITICAL MARKS
+        U+1AB0 - U+1AFF - COMBINING DIACRITICAL MARKS EXTENDED
+        U+1DC0 - U+1DFF - COMBINING DIACRITICAL MARKS SUPPLEMENT
+        U+20D0 - U+20FF - COMBINING DIACRITICAL MARKS FOR SYMBOLS
+        U+FE20 - U+FE2F - COMBINING HALF MARKS
         """
-        print(self.server.zalgo_tolerance)
-        filtered = re.sub('([\u0300\u036f\u1ab0\u1aff\u1dc0\u1dff\u20d0\u20ff\ufe20\ufe2f]' +
+
+        filtered = re.sub('([\u0300-\u036f\u1ab0-\u1aff\u1dc0-\u1dff\u20d0-\u20ff\ufe20-\ufe2f]' +
                           '{' + re.escape(str(self.server.zalgo_tolerance)) + ',})',
                           '', input)
         return filtered
@@ -110,12 +117,14 @@ class AOProtocol(asyncio.Protocol):
         try:
             self.client = self.server.new_client(transport)
         except ClientError:
+            transport.close()
             return
 
-        if not self.server.client_manager.new_client_preauth(transport):
-            self.client.send_command('BD', 'DOS Prevention. Maximum clients reached. \n Disconnect one of your clients to continue')
+        if not self.server.client_manager.new_client_preauth(self.client):
+            self.client.send_command('BD', 'Maximum clients reached.\nDisconnect one of your clients to continue.')
             self.client.disconnect()
             return
+
         # Client needs to send CHECK#% within the timeout - otherwise,
         # it will be automatically dropped.
         self.ping_timeout = asyncio.get_event_loop().call_later(
@@ -132,6 +141,7 @@ class AOProtocol(asyncio.Protocol):
 
         """
         if self.client is not None:
+            logger.debug(f'{self.client.ipid} disconnected.')
             self.server.remove_client(self.client)
         if self.ping_timeout is not None:
             self.ping_timeout.cancel()
@@ -615,11 +625,10 @@ class AOProtocol(asyncio.Protocol):
                 called_function = f'ooc_cmd_{cmd}'
                 if cmd == 'help' and arg != '':
                     self.client.send_ooc(commands.help(f'ooc_cmd_{arg}'))
+                elif not hasattr(commands, called_function):
+                    self.client.send_ooc('Invalid command.')
                 else:
                     getattr(commands, called_function)(self.client, arg)
-            except AttributeError:
-                print('Attribute error with ' + called_function)
-                self.client.send_ooc('Invalid command.')
             except (ClientError, AreaError, ArgumentError, ServerError) as ex:
                 self.client.send_ooc(ex)
             except Exception as ex:
@@ -932,6 +941,7 @@ class AOProtocol(asyncio.Protocol):
             self.client.set_mod_call_delay()
             database.log_room('modcall', self.client, self.client.area)
         else:
+            args[0] = self.dezalgo(args[0])
             self.server.send_all_cmd_pred(
                 'ZZ',
                 '[{}] {} ({}) in {} with reason: {}'.format(
